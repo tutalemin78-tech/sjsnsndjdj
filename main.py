@@ -25,7 +25,12 @@ from typing import Any, List, Optional
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
+)
 from telethon.helpers import generate_random_long
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendMediaRequest, SetTypingRequest
@@ -579,6 +584,91 @@ async def start_health_server(port: int) -> asyncio.AbstractServer:
     return server
 
 
+
+# --------------------------------------------------------------------------- #
+# Вход в аккаунт через чат с ботом (BOT_TOKEN + OWNER_ID)
+# --------------------------------------------------------------------------- #
+async def login_via_bot(api_id: int, api_hash: str, bot_token: str, owner_id: int) -> TelegramClient:
+    """Бот на токене только ведёт диалог входа; сам вход выполняет твой аккаунт."""
+    bot = TelegramClient(StringSession(), api_id, api_hash)
+    await bot.start(bot_token=bot_token)
+    user = TelegramClient(StringSession(), api_id, api_hash)
+    await user.connect()
+
+    done: asyncio.Future = asyncio.get_running_loop().create_future()
+    ctx = {"state": "phone", "phone": "", "hash": ""}
+
+    async def wipe(event) -> None:
+        try:
+            await event.delete()   # удаляем сообщение с кодом/паролем из чата
+        except Exception:
+            pass
+
+    @bot.on(events.NewMessage(incoming=True, from_users=owner_id, func=lambda e: e.is_private))
+    async def on_login_msg(event) -> None:
+        text = (event.raw_text or "").strip()
+        try:
+            if text.startswith("/start") or text.casefold() in {"/cancel", "/отмена"}:
+                ctx["state"] = "phone"
+                await event.respond("Привет! Пришли номер своего аккаунта Telegram в формате +79991234567")
+                return
+
+            if ctx["state"] == "phone":
+                sent = await user.send_code_request(text)
+                ctx.update(state="code", phone=text, hash=sent.phone_code_hash)
+                await event.respond(
+                    "Код отправлен в приложение Telegram (чат «Telegram»).\n"
+                    "Введи его ЧЕРЕЗ ТИРЕ, иначе Telegram аннулирует код: например 1-2-3-4-5"
+                )
+
+            elif ctx["state"] == "code":
+                await wipe(event)
+                digits = re.sub(r"\D", "", text)
+                try:
+                    await user.sign_in(ctx["phone"], digits, phone_code_hash=ctx["hash"])
+                except SessionPasswordNeededError:
+                    ctx["state"] = "password"
+                    await bot.send_message(owner_id, "Нужен облачный пароль (2FA). Отправь его, сообщение удалю.")
+                    return
+                except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+                    ctx["state"] = "phone"
+                    await bot.send_message(
+                        owner_id,
+                        f"Код не подошёл ({type(e).__name__}). Начнём заново: пришли номер +7...",
+                    )
+                    return
+                if not done.done():
+                    done.set_result(True)
+
+            elif ctx["state"] == "password":
+                await wipe(event)
+                await user.sign_in(password=text)
+                if not done.done():
+                    done.set_result(True)
+        except Exception as e:
+            log.exception("Ошибка входа через бота")
+            await bot.send_message(owner_id, f"❌ {explain(e)}\nОтправь /start, чтобы начать заново.")
+            ctx["state"] = "phone"
+
+    log.info("Режим входа: напиши /start своему боту в Telegram")
+    try:
+        await bot.send_message(owner_id, "Бот запущен. Отправь /start, чтобы войти в аккаунт.")
+    except Exception as e:
+        log.info("Не смог написать первым (нажми Start у бота сам): %s", e)
+
+    await done
+    session = user.session.save()
+    await bot.send_message(
+        owner_id,
+        "✅ Вход выполнен. Юзербот уже работает.\n\n"
+        "Чтобы он пережил перезапуск, добавь в Render переменную SESSION_STRING "
+        "со значением из следующего сообщения. Потом удали это сообщение у себя.",
+    )
+    await bot.send_message(owner_id, session)
+    await bot.disconnect()
+    return user
+
+
 # --------------------------------------------------------------------------- #
 # Запуск
 # --------------------------------------------------------------------------- #
@@ -604,6 +694,10 @@ async def main() -> None:
         await client.connect()
         if not await client.is_user_authorized():
             sys.exit("SESSION_STRING недействительна. Создайте новую через login.py")
+    elif os.getenv("BOT_TOKEN", "").strip() and os.getenv("OWNER_ID", "").strip().isdigit():
+        client = await login_via_bot(
+            int(api_id), api_hash, os.getenv("BOT_TOKEN", "").strip(), int(os.getenv("OWNER_ID", "").strip())
+        )
     else:
         # локальный запуск: файл сессии, номер спросит Telethon
         client = TelegramClient(session_name, int(api_id), api_hash)
