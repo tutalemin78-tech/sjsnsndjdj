@@ -33,6 +33,7 @@ from telethon.errors import (
 )
 from telethon.helpers import generate_random_long
 from telethon.sessions import StringSession
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.tl.functions.messages import SendMediaRequest, SetTypingRequest
 from telethon.tl.types import (
     Channel,
@@ -588,6 +589,24 @@ async def start_health_server(port: int) -> asyncio.AbstractServer:
 # --------------------------------------------------------------------------- #
 # Вход в аккаунт через чат с ботом (BOT_TOKEN + OWNER_ID)
 # --------------------------------------------------------------------------- #
+SENT_TYPES = {
+    "SentCodeTypeApp": "в приложение Telegram (чат «Telegram», обычно закреплён вверху списка)",
+    "SentCodeTypeSms": "по SMS",
+    "SentCodeTypeCall": "голосовым звонком",
+    "SentCodeTypeFlashCall": "flash-звонком",
+    "SentCodeTypeMissedCall": "пропущенным звонком (код = последние цифры номера)",
+    "SentCodeTypeEmailCode": "на почту",
+}
+
+
+def describe_sent(sent) -> str:
+    name = type(sent.type).__name__
+    text = f"Код отправлен: {SENT_TYPES.get(name, name)}."
+    if getattr(sent, "next_type", None) is not None:
+        text += "\nНе пришёл через минуту? Отправь /resend — запросим другим способом."
+    return text
+
+
 async def login_via_bot(api_id: int, api_hash: str, bot_token: str, owner_id: int) -> TelegramClient:
     """Бот на токене только ведёт диалог входа; сам вход выполняет твой аккаунт."""
     bot = TelegramClient(StringSession(), api_id, api_hash)
@@ -617,9 +636,14 @@ async def login_via_bot(api_id: int, api_hash: str, bot_token: str, owner_id: in
                 sent = await user.send_code_request(text)
                 ctx.update(state="code", phone=text, hash=sent.phone_code_hash)
                 await event.respond(
-                    "Код отправлен в приложение Telegram (чат «Telegram»).\n"
-                    "Введи его ЧЕРЕЗ ТИРЕ, иначе Telegram аннулирует код: например 1-2-3-4-5"
+                    describe_sent(sent)
+                    + "\n\nКод вводи ЧЕРЕЗ ТИРЕ, иначе Telegram аннулирует его: например 1-2-3-4-5"
                 )
+
+            elif ctx["state"] == "code" and text.casefold() in {"/resend", "/sms"}:
+                sent = await user(ResendCodeRequest(ctx["phone"], ctx["hash"]))
+                ctx["hash"] = sent.phone_code_hash
+                await event.respond(describe_sent(sent))
 
             elif ctx["state"] == "code":
                 await wipe(event)
@@ -699,6 +723,13 @@ async def main() -> None:
             int(api_id), api_hash, os.getenv("BOT_TOKEN", "").strip(), int(os.getenv("OWNER_ID", "").strip())
         )
     else:
+        if not sys.stdin.isatty():
+            sys.exit(
+                "Нет SESSION_STRING и нет пары BOT_TOKEN + OWNER_ID (проверь имена и значения "
+                "в Environment на Render). Найдено: "
+                f"BOT_TOKEN={'да' if os.getenv('BOT_TOKEN') else 'НЕТ'}, "
+                f"OWNER_ID={'да' if os.getenv('OWNER_ID') else 'НЕТ'}"
+            )
         # локальный запуск: файл сессии, номер спросит Telethon
         client = TelegramClient(session_name, int(api_id), api_hash)
         await client.start(**({"phone": phone} if phone else {}))
